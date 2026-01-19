@@ -60,6 +60,14 @@ static unsigned int get_slab_idx(size_t num)
 #define PAGE_MASK (~(page_size - 1))
 #define PAGE_START(x) (void *)((uintptr_t)(x) & PAGE_MASK)
 
+static inline struct slab_ring *get_slab_ring(void *addr)
+{
+    uintptr_t slab_ring_ptr = (uintptr_t)PAGE_START(addr);
+    slab_ring_ptr += page_size;
+    slab_ring_ptr -= sizeof(struct slab_ring);
+    return (struct slab_ring *)slab_ring_ptr;
+}
+
 static void *select_obj(struct slab_ring *slab)
 {
     uint32_t i;
@@ -90,6 +98,63 @@ try_again:
     return NULL;
 }
 
+static struct slab_ring *create_new_slab(struct slab_info *slab)
+{
+    void *new;
+    size_t page_size_long = (size_t)page_size;
+    struct slab_ring *new_ring;
+    uint32_t count;
+    size_t computed_size;
+    size_t available_size;
+    uintptr_t bitmap_ptr;
+
+    if (!posix_memalign(&new, page_size_long, page_size_long))
+        return NULL;
+
+    /*
+     * setup this slab
+     */
+    new_ring = get_slab_ring(new);
+
+    new_ring->info = slab;
+    new_ring->available_objs = 0;
+    available_size = (page_size - sizeof(struct slab_ring)) * slab->obj_size;
+    for (count = 0; count < (page_size - sizeof(struct slab_ring)) * slab->obj_size; count+=64) {
+        computed_size = (count * sizeof(slab->obj_size));
+        if (computed_size > available_size)
+            break;
+        available_size -= sizeof(uint64_t);
+    }
+    new_ring->available_objs = count - 64;
+    bitmap_ptr = (uintptr_t)new_ring;
+    bitmap_ptr -= count / 64;
+    new_ring->bitmap = (uint64_t *)bitmap_ptr;
+    return new_ring;
+}
+
+static void *create_obj_in_new_slab(struct slab_info *slab)
+{
+    struct slab_ring *new = create_new_slab(slab);
+    void *obj;
+
+    if (new == NULL)
+        return NULL;
+    /*
+     * we can cheat here a bit, since no one else sees this slab yet
+     */
+    obj = PAGE_START(new);
+    new->available_objs--;
+    new->bitmap[0] = 0x1;
+
+    /*
+     * Now insert the slab to the list
+     */
+    pthread_rwlock_wrlock(&slab->ring_lock);
+    LIST_INSERT_HEAD(&slab->entries, new, entry);
+    pthread_rwlock_unlock(&slab->ring_lock);
+    return obj;
+}
+
 static void *get_slab_obj(struct slab_info *slab)
 {
     struct slab_ring *idx;
@@ -110,7 +175,9 @@ try_again:
             return obj;
         }
     }
-
+    pthread_rwlock_unlock(&slab->ring_lock);
+    /* We need to create a new slab */
+    return create_obj_in_new_slab(slab);
 }
 
 static void *slab_malloc(size_t num, const char *file, int line)
