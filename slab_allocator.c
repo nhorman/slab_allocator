@@ -10,12 +10,15 @@ static long page_size = 0;
 
 struct slab_info;
 
+#define SLAB_MAGIC 0xdeadf00ddeadf00dUL
+
 struct slab_ring {
     LIST_ENTRY(slab_ring) entry; 
     struct slab_info *info;
     uint32_t available_objs;
     uint64_t *bitmap;
     uint32_t bitmap_word_count;
+    uint64_t magic;
 };
 
 LIST_HEAD(slab_entries, slab_ring);
@@ -41,7 +44,7 @@ static struct slab_info slabs[] = {
     {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), MAX_SLAB}
 };
 
-static unsigned int get_slab_idx(size_t num)
+static inline size_t slab_size(size_t num)
 {
     if (num == 0)
         return 0; /* return index zero */
@@ -54,7 +57,14 @@ static unsigned int get_slab_idx(size_t num)
     num |= num >> 8;
     num |= num >> 16;
     num |= num >> 32;
-    return __builtin_ctzl(num);
+    return num;
+}
+
+static unsigned int get_slab_idx(size_t num)
+{
+    size_t up_size = slab_size(num);
+
+    return __builtin_ctzl(up_size);
 }
 
 #define PAGE_MASK (~(page_size - 1))
@@ -129,6 +139,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     bitmap_ptr = (uintptr_t)new_ring;
     bitmap_ptr -= count / 64;
     new_ring->bitmap = (uint64_t *)bitmap_ptr;
+    new_ring->magic = SLAB_MAGIC;
     return new_ring;
 }
 
