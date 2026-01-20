@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <string.h>
 #include <stdatomic.h>
 #include <sys/queue.h>
 #include <openssl/crypto.h>
@@ -85,6 +86,13 @@ static inline struct slab_ring *get_slab_ring(void *addr)
     slab_ring_ptr += page_size;
     slab_ring_ptr -= sizeof(struct slab_ring);
     return (struct slab_ring *)slab_ring_ptr;
+}
+
+static inline int is_obj_slab(void *addr)
+{
+    struct slab_ring *slab = get_slab_ring(addr);
+
+    return (slab->magic == SLAB_MAGIC) ? 1 : 0;
 }
 
 static void *select_obj(struct slab_ring *slab)
@@ -204,14 +212,32 @@ static void *slab_malloc(size_t num, const char *file, int line)
     return get_slab_obj(&slabs[slab_idx]);
 }
 
-static void *slab_realloc(void *addr, size_t num, const char *file, int line)
-{
-    return realloc(addr, num);
-}
-
 static void slab_free(void *addr, const char *file, int line)
 {
     free(addr);
+}
+
+static void *slab_realloc(void *addr, size_t num, const char *file, int line)
+{
+    void *new;
+    struct slab_ring *ring;
+
+    if (!is_obj_slab(addr))
+        return realloc(addr, num);
+    ring = get_slab_ring(addr);
+    if (num > MAX_SLAB) {
+        new = malloc(num);
+        if (new != NULL)
+            memcpy(new, addr, ring->info->obj_size);
+        slab_free(addr, NULL, 0);
+        return new;
+    }
+    if (num <= ring->info->obj_size)
+        return addr;
+    new = slab_malloc(num, NULL, 0);
+    if (new != NULL)
+        memcpy(new, addr, ring->info->obj_size);
+    return new;
 }
 
 static void compute_slab_template(struct slab_info *slab)
