@@ -23,25 +23,34 @@ struct slab_ring {
 
 LIST_HEAD(slab_entries, slab_ring);
 
+struct slab_template {
+    uint32_t available_objs;
+    uint32_t bitmap_word_count;
+};
+
 struct slab_info {
     pthread_rwlock_t ring_lock;
     struct slab_entries entries;
     size_t obj_size;
+    struct slab_template template;
 };
 
-#define MAX_SLAB 1 << 10
+#define MAX_SLAB_IDX 10
+#define MAX_SLAB 1 << MAX_SLAB_IDX
+#define EMPTY_SLAB_TEMPLATE { 0, 0 }
+
 static struct slab_info slabs[] = {
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 0},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 1},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 2},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 3},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 4},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 5},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 6},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 7},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 8},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 9},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), MAX_SLAB}
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 0, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 1, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 2, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 3, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 4, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 5, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 6, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 7, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 8, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 9, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), MAX_SLAB, EMPTY_SLAB_TEMPLATE}
 };
 
 static inline size_t slab_size(size_t num)
@@ -127,17 +136,10 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     new_ring = get_slab_ring(new);
 
     new_ring->info = slab;
-    new_ring->available_objs = 0;
-    available_size = (page_size - sizeof(struct slab_ring)) * slab->obj_size;
-    for (count = 0; count < (page_size - sizeof(struct slab_ring)) * slab->obj_size; count+=64) {
-        computed_size = (count * sizeof(slab->obj_size));
-        if (computed_size > available_size)
-            break;
-        available_size -= sizeof(uint64_t);
-    }
-    new_ring->available_objs = count - 64;
+    new_ring->available_objs = slab->template.available_objs;
+    new_ring->bitmap_word_count = slab->template.bitmap_word_count;
     bitmap_ptr = (uintptr_t)new_ring;
-    bitmap_ptr -= count / 64;
+    bitmap_ptr -= (new_ring->bitmap_word_count * sizeof(uint64_t)); 
     new_ring->bitmap = (uint64_t *)bitmap_ptr;
     new_ring->magic = SLAB_MAGIC;
     return new_ring;
@@ -212,13 +214,47 @@ static void slab_free(void *addr, const char *file, int line)
     free(addr);
 }
 
+static void compute_slab_template(struct slab_info *slab)
+{
+    uint32_t bitmap_words  = 1; /* need at least one bitmap word */
+    uint32_t obj_count;
+    size_t objs_size;
+    size_t available_size = (page_size - sizeof(struct slab_ring)) - (bitmap_words * sizeof(uint64_t));
+    int word_size_increased;
+
+    for (obj_count = 1; ; obj_count++) {
+        word_size_increased = 0;
+        if ((obj_count % 64) == 0) {
+            bitmap_words++;
+            available_size = (page_size - sizeof(struct slab_ring)) - (bitmap_words * sizeof(uint64_t));
+            word_size_increased = 1;
+        }
+        objs_size = obj_count * slab->obj_size;
+        if (objs_size > available_size) {
+            /* we went too far */
+            if (word_size_increased == 1)
+                bitmap_words--;
+            obj_count--;
+            break;
+        }
+    }
+    slab->template.available_objs = obj_count;
+    slab->template.bitmap_word_count = bitmap_words;
+    return;
+}
+
 static __attribute__((constructor)) void setup_slab_allocator()
 {
+    int i;
+
     fprintf(stderr, "Setting up slab allocator\n");
     if (!CRYPTO_set_mem_functions(slab_malloc, slab_realloc, slab_free))
         fprintf(stderr, "Failed to setup slag allocator\n");
     page_size = sysconf(_SC_PAGESIZE);
     if (page_size == -1)
         fprintf(stderr, "Failed to get page size\n");
+    for (i = 0; i < MAX_SLAB_IDX; i++) {
+        compute_slab_template(&slabs[i]);
+    }
 }
 
