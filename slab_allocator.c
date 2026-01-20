@@ -13,6 +13,18 @@ struct slab_info;
 
 #define SLAB_MAGIC 0xdeadf00ddeadf00dUL
 
+#ifdef SLAB_STATS
+struct slab_stats {
+    size_t allocs;
+    size_t frees;
+    size_t slabs;
+};
+
+#define INC_SLAB_STAT(metric) __atomic_add_fetch(metric, 1, __ATOMIC_ACQ_REL)
+#else
+#define INC_SLAB_STAT(metric)
+#endif
+
 struct slab_ring {
     LIST_ENTRY(slab_ring) entry; 
     struct slab_info *info;
@@ -33,6 +45,9 @@ struct slab_info {
     pthread_rwlock_t ring_lock;
     struct slab_entries entries;
     size_t obj_size;
+#ifdef SLAB_STATS
+    struct slab_stats stats;
+#endif
     struct slab_template template;
 };
 
@@ -151,6 +166,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     bitmap_ptr -= (new_ring->bitmap_word_count * sizeof(uint64_t)); 
     new_ring->bitmap = (uint64_t *)bitmap_ptr;
     new_ring->magic = SLAB_MAGIC;
+    INC_SLAB_STAT(&slab->stats.slabs);
     return new_ring;
 }
 
@@ -240,6 +256,7 @@ static void *slab_malloc(size_t num, const char *file, int line)
         return malloc(num);
 
     slab_idx = get_slab_idx(num);
+    INC_SLAB_STAT(&slabs[slab_idx].stats.allocs);
     return get_slab_obj(&slabs[slab_idx]);
 }
 
@@ -252,6 +269,7 @@ static void slab_free(void *addr, const char *file, int line)
         return;
     }
     ring = get_slab_ring(addr);
+    INC_SLAB_STAT(&ring->info->stats.frees);
     return_to_slab(addr, ring);
 }
 
@@ -318,8 +336,34 @@ static __attribute__((constructor)) void setup_slab_allocator()
     page_size = sysconf(_SC_PAGESIZE);
     if (page_size == -1)
         fprintf(stderr, "Failed to get page size\n");
-    for (i = 0; i < MAX_SLAB_IDX; i++) {
+    for (i = 0; i <= MAX_SLAB_IDX; i++) {
         compute_slab_template(&slabs[i]);
     }
+}
+
+static __attribute__((destructor)) void slab_cleanup()
+{
+#ifdef SLAB_STATS
+    FILE *fp = stderr;
+    char *path = getenv("SLAB_ALLOCATOR_LOG");
+    int i;
+
+    if (path != NULL) {
+        fp = fopen(path, "w");
+        if (fp == NULL)
+            fp = stderr;
+    }
+    fprintf(fp, "{\"slabs\": [");
+
+    for (i = 0; i <= MAX_SLAB_IDX; i++) {
+        fprintf(fp, "{\"obj_size\":%lu, \"objs_per_slab\":%lu, \"allocs\":%lu, \"frees\":%lu, \"slabs\":%lu}",
+            slabs[i].obj_size, slabs[i].template.available_objs, slabs[i].stats.allocs, slabs[i].stats.frees, slabs[i].stats.slabs);
+        if (i != MAX_SLAB_IDX)
+            fprintf(fp,",");
+    }
+    fprintf(fp, "]}");
+    if (fp != stderr)
+        fclose(fp);
+#endif
 }
 
