@@ -247,8 +247,10 @@ static void slab_free(void *addr, const char *file, int line)
 {
     struct slab_ring *ring;
 
-    if (!is_obj_slab(addr))
+    if (addr == NULL || !is_obj_slab(addr)) {
         free(addr);
+        return;
+    }
     ring = get_slab_ring(addr);
     return_to_slab(addr, ring);
 }
@@ -273,6 +275,7 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
     new = slab_malloc(num, NULL, 0);
     if (new != NULL)
         memcpy(new, addr, ring->info->obj_size);
+    slab_free(addr, NULL, 0);
     return new;
 }
 
