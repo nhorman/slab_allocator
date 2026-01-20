@@ -67,6 +67,7 @@ static inline size_t slab_size(size_t num)
     num |= num >> 8;
     num |= num >> 16;
     num |= num >> 32;
+    num++;
     return num;
 }
 
@@ -135,7 +136,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     size_t available_size;
     uintptr_t bitmap_ptr;
 
-    if (!posix_memalign(&new, page_size_long, page_size_long))
+    if (posix_memalign(&new, page_size_long, page_size_long))
         return NULL;
 
     /*
@@ -201,6 +202,36 @@ try_again:
     return create_obj_in_new_slab(slab);
 }
 
+static void return_to_slab(void *addr, struct slab_ring *ring)
+{
+    uintptr_t base = (uintptr_t)PAGE_START(addr);
+    uintptr_t offset = (uintptr_t)addr - base;
+    size_t bit_idx = offset / ring->info->obj_size;
+    size_t word_idx = bit_idx / 64;
+    uint64_t value;
+    uint32_t available, new;
+
+    bit_idx = bit_idx % 64;
+
+    value = 1 << bit_idx;
+    value = ~value;
+
+    /*
+     * Clear the bit for this object
+     */
+    __atomic_and_fetch(&ring->bitmap[word_idx], value, __ATOMIC_RELAXED);
+
+    /*
+     * And up the obj count again
+     */
+try_again:
+    available = __atomic_load_n(&ring->available_objs, __ATOMIC_RELAXED);
+    new = available + 1;
+    if (!__atomic_compare_exchange(&ring->available_objs, &available, &new, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        goto try_again;
+
+}
+
 static void *slab_malloc(size_t num, const char *file, int line)
 {
     unsigned int slab_idx;
@@ -214,7 +245,12 @@ static void *slab_malloc(size_t num, const char *file, int line)
 
 static void slab_free(void *addr, const char *file, int line)
 {
-    free(addr);
+    struct slab_ring *ring;
+
+    if (!is_obj_slab(addr))
+        free(addr);
+    ring = get_slab_ring(addr);
+    return_to_slab(addr, ring);
 }
 
 static void *slab_realloc(void *addr, size_t num, const char *file, int line)
