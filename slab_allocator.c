@@ -127,7 +127,7 @@ try_again:
         if (value < UINT64_MAX) {
             value = ~slab->bitmap[i];
             available_bit = __builtin_ctzl(value);
-            new_mask = 1 << available_bit;
+            new_mask = (uint64_t)1 << available_bit;
             value = atomic_fetch_or(&slab->bitmap[i], new_mask);
             if ((value & new_mask) == new_mask) {
                 /* another  thread already set this bit, try again */
@@ -165,6 +165,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     bitmap_ptr = (uintptr_t)new_ring;
     bitmap_ptr -= (new_ring->bitmap_word_count * sizeof(uint64_t)); 
     new_ring->bitmap = (uint64_t *)bitmap_ptr;
+    memset(new_ring->bitmap, 0, sizeof(uint64_t) * new_ring->bitmap_word_count);
     new_ring->magic = SLAB_MAGIC;
     INC_SLAB_STAT(&slab->stats.slabs);
     return new_ring;
@@ -210,11 +211,14 @@ try_again:
             /* There is at least one free object in this slab */
             obj = select_obj(idx);
             pthread_rwlock_unlock(&slab->ring_lock);
+            if (obj == NULL)
+                goto new_slab;
             return obj;
         }
     }
     pthread_rwlock_unlock(&slab->ring_lock);
     /* We need to create a new slab */
+new_slab:
     return create_obj_in_new_slab(slab);
 }
 
@@ -277,6 +281,9 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
 {
     void *new;
     struct slab_ring *ring;
+
+    if (addr == NULL)
+        return slab_malloc(num, NULL, 0);
 
     if (!is_obj_slab(addr))
         return realloc(addr, num);
