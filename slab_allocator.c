@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <sys/queue.h>
+#include <sys/mman.h>
 #include <openssl/crypto.h>
 
 static long page_size = 0;
@@ -152,7 +153,8 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     uintptr_t bitmap_ptr;
     uint64_t last_word_mask;
 
-    if (posix_memalign(&new, page_size_long, page_size_long))
+    new = mmap(NULL, page_size_long, PROT_READ|PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (new == NULL)
         return NULL;
 
     /*
