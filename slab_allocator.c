@@ -220,9 +220,6 @@ static void return_to_slab(void *addr, struct slab_ring *ring)
     uint64_t value;
     uint32_t available, new;
 
-    if (addr == NULL)
-        return;
-
     base = (uintptr_t)ring->obj_start;
     offset = (uintptr_t)addr - base;
     bit_idx = offset / ring->info->obj_size;
@@ -230,7 +227,7 @@ static void return_to_slab(void *addr, struct slab_ring *ring)
 
     bit_idx = bit_idx % 64;
 
-    value = 1 << bit_idx;
+    value = (uint64_t)1 << bit_idx;
     value = ~value;
 
     /*
