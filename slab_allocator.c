@@ -32,6 +32,7 @@ struct slab_ring {
     uint32_t available_objs;
     uint64_t *bitmap;
     uint32_t bitmap_word_count;
+    void *obj_start;
     uint64_t magic;
 };
 
@@ -99,10 +100,7 @@ static unsigned int get_slab_idx(size_t num)
 
 static inline struct slab_ring *get_slab_ring(void *addr)
 {
-    uintptr_t slab_ring_ptr = (uintptr_t)PAGE_START(addr);
-    slab_ring_ptr += page_size;
-    slab_ring_ptr -= sizeof(struct slab_ring);
-    return (struct slab_ring *)slab_ring_ptr;
+    return (struct slab_ring *)PAGE_START(addr);
 }
 
 static inline int is_obj_slab(void *addr)
@@ -118,7 +116,6 @@ static void *select_obj(struct slab_ring *slab)
     uint64_t value;
     uint32_t available_bit;
     uint64_t new_mask;
-    void *slab_start = PAGE_START(slab);
     uint32_t obj_offset;
     void *obj;
 
@@ -136,7 +133,7 @@ try_again:
             }
             /* We got an object! */
             obj_offset = (slab->info->obj_size * (i * 64)) + (available_bit * slab->info->obj_size);
-            return (void *)((unsigned char *)slab_start + obj_offset);
+            return (void *)((unsigned char *)slab->obj_start + obj_offset);
         }
     }
     return NULL;
@@ -150,7 +147,6 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     uint32_t count;
     size_t computed_size;
     size_t available_size;
-    uintptr_t bitmap_ptr;
     uint64_t last_word_mask;
 
     new = mmap(NULL, page_size_long, PROT_READ|PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -165,13 +161,12 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     new_ring->info = slab;
     new_ring->available_objs = slab->template.available_objs;
     new_ring->bitmap_word_count = slab->template.bitmap_word_count;
-    bitmap_ptr = (uintptr_t)new_ring;
-    bitmap_ptr -= (new_ring->bitmap_word_count * sizeof(uint64_t)); 
-    new_ring->bitmap = (uint64_t *)bitmap_ptr;
+    new_ring->bitmap = (uint64_t *)(((unsigned char *)new_ring) + sizeof(struct slab_ring));
     memset(new_ring->bitmap, 0, sizeof(uint64_t) * new_ring->bitmap_word_count);
     last_word_mask = 1 << (slab->template.available_objs % 64);
     /* mark the remaining words in the last word count as unavailable */
     new_ring->bitmap[new_ring->bitmap_word_count - 1] = ~(last_word_mask - 1);
+    new_ring->obj_start = (void *)(new_ring->bitmap + new_ring->bitmap_word_count);
     new_ring->magic = SLAB_MAGIC;
     INC_SLAB_STAT(&slab->stats.slabs);
     return new_ring;
@@ -187,9 +182,8 @@ static void *create_obj_in_new_slab(struct slab_info *slab)
     /*
      * we can cheat here a bit, since no one else sees this slab yet
      */
-    obj = PAGE_START(new);
-    new->available_objs--;
-    new->bitmap[0] = 0x1;
+    new->bitmap[0] |= 0x1;
+    obj = new->obj_start;
 
     /*
      * Now insert the slab to the list
@@ -221,7 +215,7 @@ new_slab:
 
 static void return_to_slab(void *addr, struct slab_ring *ring)
 {
-    uintptr_t base = (uintptr_t)PAGE_START(addr);
+    uintptr_t base = (uintptr_t)ring->obj_start;
     uintptr_t offset = (uintptr_t)addr - base;
     size_t bit_idx = offset / ring->info->obj_size;
     size_t word_idx = bit_idx / 64;
@@ -237,16 +231,6 @@ static void return_to_slab(void *addr, struct slab_ring *ring)
      * Clear the bit for this object
      */
     __atomic_and_fetch(&ring->bitmap[word_idx], value, __ATOMIC_RELAXED);
-
-    /*
-     * And up the obj count again
-     */
-try_again:
-    available = __atomic_load_n(&ring->available_objs, __ATOMIC_RELAXED);
-    new = available + 1;
-    if (!__atomic_compare_exchange(&ring->available_objs, &available, &new, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-        goto try_again;
-
 }
 
 static void *slab_malloc(size_t num, const char *file, int line)
