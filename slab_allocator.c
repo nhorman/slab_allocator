@@ -150,6 +150,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     size_t computed_size;
     size_t available_size;
     uintptr_t bitmap_ptr;
+    uint64_t last_word_mask;
 
     if (posix_memalign(&new, page_size_long, page_size_long))
         return NULL;
@@ -166,6 +167,9 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     bitmap_ptr -= (new_ring->bitmap_word_count * sizeof(uint64_t)); 
     new_ring->bitmap = (uint64_t *)bitmap_ptr;
     memset(new_ring->bitmap, 0, sizeof(uint64_t) * new_ring->bitmap_word_count);
+    last_word_mask = 1 << (slab->template.available_objs % 64);
+    /* mark the remaining words in the last word count as unavailable */
+    new_ring->bitmap[new_ring->bitmap_word_count - 1] = ~(last_word_mask - 1);
     new_ring->magic = SLAB_MAGIC;
     INC_SLAB_STAT(&slab->stats.slabs);
     return new_ring;
@@ -197,26 +201,17 @@ static void *create_obj_in_new_slab(struct slab_info *slab)
 static void *get_slab_obj(struct slab_info *slab)
 {
     struct slab_ring *idx;
-    void *obj;
-    uint32_t available, new;
+    void *obj = NULL;
 
     pthread_rwlock_rdlock(&slab->ring_lock);
     LIST_FOREACH(idx, &slab->entries, entry) {
-try_again:
-        available = __atomic_load_n(&idx->available_objs, __ATOMIC_RELAXED);
-        if (available > 0) {
-            new = available - 1;
-            if (!__atomic_compare_exchange(&idx->available_objs, &available, &new, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-                goto try_again;
-            /* There is at least one free object in this slab */
-            obj = select_obj(idx);
-            pthread_rwlock_unlock(&slab->ring_lock);
-            if (obj == NULL)
-                goto new_slab;
-            return obj;
-        }
+        obj = select_obj(idx);
+        if (obj != NULL)
+            break;
     }
     pthread_rwlock_unlock(&slab->ring_lock);
+    if (obj != NULL)
+        return obj;
     /* We need to create a new slab */
 new_slab:
     return create_obj_in_new_slab(slab);
