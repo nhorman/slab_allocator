@@ -41,6 +41,7 @@ LIST_HEAD(slab_entries, slab_ring);
 struct slab_template {
     uint32_t available_objs;
     uint32_t bitmap_word_count;
+    uint64_t last_word_mask;
 };
 
 struct slab_info {
@@ -147,7 +148,6 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     uint32_t count;
     size_t computed_size;
     size_t available_size;
-    uint64_t last_word_mask;
 
     new = mmap(NULL, page_size_long, PROT_READ|PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (new == NULL)
@@ -163,9 +163,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     new_ring->bitmap_word_count = slab->template.bitmap_word_count;
     new_ring->bitmap = (uint64_t *)(((unsigned char *)new_ring) + sizeof(struct slab_ring));
     memset(new_ring->bitmap, 0, sizeof(uint64_t) * new_ring->bitmap_word_count);
-    last_word_mask = 1 << (slab->template.available_objs % 64);
-    /* mark the remaining words in the last word count as unavailable */
-    new_ring->bitmap[new_ring->bitmap_word_count - 1] = ~(last_word_mask - 1);
+    new_ring->bitmap[new_ring->bitmap_word_count - 1] = slab->template.last_word_mask;
     new_ring->obj_start = (void *)(new_ring->bitmap + new_ring->bitmap_word_count);
     new_ring->magic = SLAB_MAGIC;
     INC_SLAB_STAT(&slab->stats.slabs);
@@ -215,12 +213,20 @@ new_slab:
 
 static void return_to_slab(void *addr, struct slab_ring *ring)
 {
-    uintptr_t base = (uintptr_t)ring->obj_start;
-    uintptr_t offset = (uintptr_t)addr - base;
-    size_t bit_idx = offset / ring->info->obj_size;
-    size_t word_idx = bit_idx / 64;
+    uintptr_t base;
+    uintptr_t offset;
+    size_t bit_idx;
+    size_t word_idx;
     uint64_t value;
     uint32_t available, new;
+
+    if (addr == NULL)
+        return;
+
+    base = (uintptr_t)ring->obj_start;
+    offset = (uintptr_t)addr - base;
+    bit_idx = offset / ring->info->obj_size;
+    word_idx = bit_idx / 64;
 
     bit_idx = bit_idx % 64;
 
@@ -292,6 +298,7 @@ static void compute_slab_template(struct slab_info *slab)
     size_t objs_size;
     size_t available_size = (page_size - sizeof(struct slab_ring)) - (bitmap_words * sizeof(uint64_t));
     int word_size_increased;
+    int i;
 
     for (obj_count = 1; ; obj_count++) {
         word_size_increased = 0;
@@ -311,6 +318,9 @@ static void compute_slab_template(struct slab_info *slab)
     }
     slab->template.available_objs = obj_count;
     slab->template.bitmap_word_count = bitmap_words;
+    slab->template.last_word_mask = (uint64_t)1 << (slab->template.available_objs % 64);
+    for (i = slab->template.available_objs % 64; i < 64; i++)
+        slab->template.last_word_mask = slab->template.last_word_mask | (uint64_t)1 << i;
     return;
 }
 
