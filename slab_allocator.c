@@ -455,7 +455,7 @@ static void *select_obj(struct slab_ring *slab)
              * zeros.  The result is the first bit in the bitmap that
              * is 0, which is our next free object
              */
-            value = ~slab->bitmap[i];
+            value = ~value;
             available_bit = __builtin_ctzl(value);
 
             /*
