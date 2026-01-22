@@ -41,7 +41,6 @@
  *       distinguish slab-managed objects from heap allocations.
  */
 
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -51,7 +50,6 @@
 #include <sys/queue.h>
 #include <sys/mman.h>
 #include <openssl/crypto.h>
-
 
 /**
  * @brief Global and supporting definitions for the slab allocator.
@@ -130,7 +128,8 @@ struct slab_ring {
     /**
      * Linkage for inclusion in the size-class slab list.
      */
-    LIST_ENTRY(slab_ring) entry;
+    LIST_ENTRY(slab_ring)
+    entry;
 
     /**
      * Pointer to the slab size-class descriptor associated with this slab.
@@ -445,8 +444,8 @@ static void *select_obj(struct slab_ring *slab)
     uint32_t obj_offset;
     void *obj;
 
-    for (i=0;i<slab->bitmap_word_count;i++) {
-try_again:
+    for (i = 0; i < slab->bitmap_word_count; i++) {
+    try_again:
         value = __atomic_load_n(&slab->bitmap[i], __ATOMIC_RELAXED);
         if (value < UINT64_MAX) {
             /*
@@ -508,7 +507,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
      * New slabs must be page aligned so that our page offset math works.
      * So use mmap to grap a page
      */
-    new = mmap(NULL, page_size_long, PROT_READ|PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    new = mmap(NULL, page_size_long, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (new == NULL)
         return NULL;
 
@@ -589,7 +588,7 @@ static void *get_slab_obj(struct slab_info *slab)
 {
     struct slab_ring *idx;
     void *obj = NULL;
-    
+
     idx = __atomic_load_n(&slab->available, __ATOMIC_RELAXED);
     if (idx != NULL)
         obj = select_obj(idx);
@@ -667,7 +666,7 @@ static void return_to_slab(void *addr, struct slab_ring *ring)
      * Test the entire bitmap to see if there are any more allocated objects
      */
     for (i = 0; i < ring->bitmap_word_count; i++) {
-        value = __atomic_load_n(&ring->bitmap[i], __ATOMIC_RELAXED); 
+        value = __atomic_load_n(&ring->bitmap[i], __ATOMIC_RELAXED);
         /*
          * the last word in the bitmap needs to be compared to the
          * last_word_mask, as there may be objects that were pre-emptively
@@ -853,13 +852,13 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
      */
 
     new = slab_malloc(num, NULL, 0);
-    
+
     /*
      * And if its not null, copy the old object into the new space
      */
     if (new != NULL)
         memcpy(new, addr, ring->info->obj_size);
-    
+
     /*
      * and free the old object
      */
@@ -888,7 +887,7 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
  */
 static void compute_slab_template(struct slab_info *slab)
 {
-    uint32_t bitmap_words  = 1; /* need at least one bitmap word */
+    uint32_t bitmap_words = 1; /* need at least one bitmap word */
     uint32_t obj_count;
     size_t objs_size;
     size_t available_size = (page_size - sizeof(struct slab_ring)) - (bitmap_words * sizeof(uint64_t));
@@ -901,7 +900,7 @@ static void compute_slab_template(struct slab_info *slab)
      * iteratively compare an increasing number of objects' storage needs to the available size
      * in the slab, based on the storage needed to track its meta data.  Stop when we get too big
      */
-    for (obj_count = 1; ; obj_count++) {
+    for (obj_count = 1;; obj_count++) {
         word_size_increased = 0;
         if ((obj_count % 64) == 0) {
             bitmap_words++;
@@ -992,11 +991,10 @@ static __attribute__((destructor)) void slab_cleanup()
             slabs[i].stats.slab_allocs, slabs[i].stats.slab_frees,
             slabs[i].stats.failed_slab_frees);
         if (i != MAX_SLAB_IDX)
-            fprintf(fp,",");
+            fprintf(fp, ",");
     }
     fprintf(fp, "]}");
     if (fp != stderr)
         fclose(fp);
 #endif
 }
-
