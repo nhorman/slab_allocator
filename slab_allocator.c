@@ -46,6 +46,7 @@ struct slab_template {
 
 struct slab_info {
     pthread_rwlock_t ring_lock;
+    struct slab_ring *available;
     struct slab_entries entries;
     size_t obj_size;
 #ifdef SLAB_STATS
@@ -59,17 +60,17 @@ struct slab_info {
 #define EMPTY_SLAB_TEMPLATE { 0, 0 }
 
 static struct slab_info slabs[] = {
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 0, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 1, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 2, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 3, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 4, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 5, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 6, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 7, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 8, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), 1 << 9, EMPTY_SLAB_TEMPLATE},
-    {PTHREAD_RWLOCK_INITIALIZER, LIST_HEAD_INITIALIZER(entries), MAX_SLAB, EMPTY_SLAB_TEMPLATE}
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 0, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 1, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 2, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 3, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 4, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 5, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 6, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 7, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 8, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), 1 << 9, EMPTY_SLAB_TEMPLATE},
+    {PTHREAD_RWLOCK_INITIALIZER, NULL, LIST_HEAD_INITIALIZER(entries), MAX_SLAB, EMPTY_SLAB_TEMPLATE}
 };
 
 static inline size_t slab_size(size_t num)
@@ -189,6 +190,7 @@ static void *create_obj_in_new_slab(struct slab_info *slab)
     pthread_rwlock_wrlock(&slab->ring_lock);
     LIST_INSERT_HEAD(&slab->entries, new, entry);
     pthread_rwlock_unlock(&slab->ring_lock);
+    __atomic_store(&slab->available, &new, __ATOMIC_RELAXED);
     return obj;
 }
 
@@ -196,6 +198,12 @@ static void *get_slab_obj(struct slab_info *slab)
 {
     struct slab_ring *idx;
     void *obj = NULL;
+    
+    idx = __atomic_load_n(&slab->available, __ATOMIC_RELAXED);
+    if (idx != NULL)
+        obj = select_obj(idx);
+    if (obj != NULL)
+        return obj;
 
     pthread_rwlock_rdlock(&slab->ring_lock);
     LIST_FOREACH(idx, &slab->entries, entry) {
