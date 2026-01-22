@@ -18,10 +18,12 @@ struct slab_info;
 struct slab_stats {
     size_t allocs;
     size_t frees;
-    size_t slabs;
+    size_t slab_allocs;
+    size_t slab_frees;
+    size_t failed_slab_frees;
 };
 
-#define INC_SLAB_STAT(metric) __atomic_add_fetch(metric, 1, __ATOMIC_ACQ_REL)
+#define INC_SLAB_STAT(metric) __atomic_add_fetch(metric, 1, __ATOMIC_RELAXED)
 #else
 #define INC_SLAB_STAT(metric)
 #endif
@@ -167,7 +169,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     new_ring->bitmap[new_ring->bitmap_word_count - 1] = slab->template.last_word_mask;
     new_ring->obj_start = (void *)(new_ring->bitmap + new_ring->bitmap_word_count);
     new_ring->magic = SLAB_MAGIC;
-    INC_SLAB_STAT(&slab->stats.slabs);
+    INC_SLAB_STAT(&slab->stats.slab_allocs);
     return new_ring;
 }
 
@@ -205,15 +207,6 @@ static void *get_slab_obj(struct slab_info *slab)
     if (obj != NULL)
         return obj;
 
-    pthread_rwlock_rdlock(&slab->ring_lock);
-    LIST_FOREACH(idx, &slab->entries, entry) {
-        obj = select_obj(idx);
-        if (obj != NULL)
-            break;
-    }
-    pthread_rwlock_unlock(&slab->ring_lock);
-    if (obj != NULL)
-        return obj;
     /* We need to create a new slab */
 new_slab:
     return create_obj_in_new_slab(slab);
@@ -227,6 +220,9 @@ static void return_to_slab(void *addr, struct slab_ring *ring)
     size_t word_idx;
     uint64_t value;
     uint32_t available, new;
+    int i;
+    struct slab_ring *current;
+    size_t page_size_long = (size_t)page_size;
 
     base = (uintptr_t)ring->obj_start;
     offset = (uintptr_t)addr - base;
@@ -242,6 +238,32 @@ static void return_to_slab(void *addr, struct slab_ring *ring)
      * Clear the bit for this object
      */
     __atomic_and_fetch(&ring->bitmap[word_idx], value, __ATOMIC_RELAXED);
+    current = __atomic_load_n(&ring->info->available, __ATOMIC_RELAXED);
+    /*
+     * if this is the ring we are currently allocating from, don't touch it
+     */
+    if (current == ring)
+        return;
+
+    for (i = 0; i < ring->bitmap_word_count; i++) {
+        value = __atomic_load_n(&ring->bitmap[i], __ATOMIC_RELAXED); 
+        if (i == ring->bitmap_word_count - 1) {
+            if (value == ring->info->template.last_word_mask) {
+                /* This slab is empty and can be freed */
+                INC_SLAB_STAT(&ring->info->stats.slab_frees);
+                pthread_rwlock_wrlock(&ring->info->ring_lock);
+                LIST_REMOVE(ring, entry);
+                pthread_rwlock_unlock(&ring->info->ring_lock);
+                if (munmap(ring, page_size_long))
+                    INC_SLAB_STAT(&ring->info->stats.failed_slab_frees);
+                return;
+            }
+        } else {
+            if (value != 0) {
+                break;
+            }
+        }
+    }
 }
 
 static void *slab_malloc(size_t num, const char *file, int line)
@@ -359,8 +381,11 @@ static __attribute__((destructor)) void slab_cleanup()
     fprintf(fp, "{\"slabs\": [");
 
     for (i = 0; i <= MAX_SLAB_IDX; i++) {
-        fprintf(fp, "{\"obj_size\":%lu, \"objs_per_slab\":%lu, \"allocs\":%lu, \"frees\":%lu, \"slabs\":%lu}",
-            slabs[i].obj_size, slabs[i].template.available_objs, slabs[i].stats.allocs, slabs[i].stats.frees, slabs[i].stats.slabs);
+        fprintf(fp, "{\"obj_size\":%lu, \"objs_per_slab\":%lu, \"allocs\":%lu, \"frees\":%lu, \"slab_allocs\":%lu, \"slab_frees\":%lu, \"failed_slab_frees\":%lu}",
+            slabs[i].obj_size, slabs[i].template.available_objs,
+            slabs[i].stats.allocs, slabs[i].stats.frees,
+            slabs[i].stats.slab_allocs, slabs[i].stats.slab_frees,
+            slabs[i].stats.failed_slab_frees);
         if (i != MAX_SLAB_IDX)
             fprintf(fp,",");
     }
