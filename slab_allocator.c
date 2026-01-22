@@ -723,6 +723,9 @@ static void *slab_malloc(size_t num, const char *file, int line)
 {
     unsigned int slab_idx;
 
+    if (num == 0)
+        return NULL;
+
     /*
      * if we are requested to provide an allocation larger than our biggest
      * slab, just use malloc
