@@ -237,7 +237,9 @@ struct slab_info {
     /**
      * Allocation and slab lifecycle statistics for this size class.
      */
+#ifdef SLAB_STATS
     struct slab_stats stats;
+#endif
 
     /**
      * Precomputed template values used when creating new slabs for this
@@ -924,6 +926,9 @@ static void compute_slab_template(struct slab_info *slab)
     slab->template.last_word_mask = (uint64_t)1 << (slab->template.available_objs % 64);
     for (i = slab->template.available_objs % 64; i < 64; i++)
         slab->template.last_word_mask = slab->template.last_word_mask | (uint64_t)1 << i;
+#ifdef SLAB_STATS
+    memset(&slab->stats, 0, sizeof(struct slab_stats));
+#endif
     return;
 }
 
