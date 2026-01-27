@@ -100,12 +100,13 @@ struct slab_info;
 
 #ifdef SLAB_DEBUG
 FILE *slab_fp = NULL;
-#define SLAB_DBG_LOG(fmt, ...) fprintf(slab_fp, fmt, __VA_ARGS__)
+#define SLAB_DBG_LOG(fmt, ...) fprintf(slab_fp, fmt, __VA_ARGS__); fflush(slab_fp)
 #else
 #define SLAB_DBG_LOG(fmt, ...)
 #endif
 
-#define SLAB_DBG_EVENT(typ, addr, event) SLAB_DBG_LOG("type:%s:addr:%p:event:%s\n", typ, (void *)addr, event)
+#define SLAB_DBG_EVENT_SZ(typ, addr, sz, event) SLAB_DBG_LOG("type:%s|addr:%p|event:%s|size:%lu|func:%s|line:%d\n", typ, (void *)addr, event, sz, OPENSSL_FUNC, OPENSSL_LINE)
+#define SLAB_DBG_EVENT(typ, addr, event) SLAB_DBG_LOG("type:%s|addr:%p|event:%s|func:%s|line:%d\n", typ, (void *)addr, event, OPENSSL_FUNC, OPENSSL_LINE)
 #define SLAB_MAGIC 0xdeadf00ddeadf00dUL
 
 #ifdef SLAB_STATS
@@ -357,7 +358,7 @@ static inline struct slab_info *get_thread_slab_table()
         memcpy(info, slabs, sizeof(slabs));
 
         pthread_setspecific(thread_slab_key, info);
-        SLAB_DBG_EVENT("allocator", info, "allocate");
+        SLAB_DBG_EVENT_SZ("allocator", info, sizeof(slabs), "allocate");
     }
     return info;
 }
@@ -503,6 +504,13 @@ static inline struct slab_ring *get_slab_ring(void *addr)
     return (struct slab_ring *)PAGE_START(addr);
 }
 
+static inline __attribute__((no_sanitize("address"))) int is_slab_magic_correct(void *addr)
+{
+    struct slab_ring *ring = get_slab_ring(addr);
+
+    return (ring->magic == SLAB_MAGIC) ? 1 : 0;
+}
+
 /**
  * @brief Determine whether an address belongs to an object slab.
  *
@@ -516,9 +524,29 @@ static inline struct slab_ring *get_slab_ring(void *addr)
  */
 static inline int is_obj_slab(void *addr)
 {
-    struct slab_ring *slab = get_slab_ring(addr);
+    uintptr_t brk_limit = (uintptr_t)sbrk(0);
 
-    return (slab->magic == SLAB_MAGIC) ? 1 : 0;
+    /*
+     * check to see if this address is below the brk limit
+     * if it is, we know that this isn't a slab
+     * We do this as a check before we trucate the address
+     * to find the page start, which may not be initialized
+     * for non slab allocations.  If we don't then things like
+     * asan get cranky and warn us about uninitialized usage
+     */
+    if ((uintptr_t)addr < brk_limit)
+        return 0;
+
+    /*
+     * also check if the address is on a page boundary
+     * This indicates that it is not a slab, as slab objects
+     * never start on a page boundary, due to the page_ring meta
+     * data being at the start of every slab
+     */
+    if ((uintptr_t)addr == (uintptr_t)PAGE_START(addr))
+        return 0;
+
+    return is_slab_magic_correct(addr);
 }
 
 /**
@@ -628,7 +656,7 @@ static struct slab_ring *create_new_slab(struct slab_info *slab)
     new_ring->obj_start = (void *)(new_ring->bitmap + new_ring->bitmap_word_count);
     new_ring->magic = SLAB_MAGIC;
     INC_SLAB_STAT(&new_ring->stats->slab_allocs);
-    SLAB_DBG_EVENT("slab",new_ring,"allocate");
+    SLAB_DBG_EVENT_SZ("slab",new_ring, page_size_long, "allocate");
     return new_ring;
 }
 
@@ -771,7 +799,7 @@ static void return_to_slab(void *addr, struct slab_ring *ring)
           /*
            * return the slab to the OS with munmap
            */
-          SLAB_DBG_EVENT("slab",ring,"allocate");
+          SLAB_DBG_EVENT("slab",ring,"free");
           if (munmap(ring, page_size_long))
               INC_SLAB_STAT(&ring->stats->failed_slab_frees);
     }
@@ -817,12 +845,16 @@ static void *slab_malloc(size_t num, const char *file, int line)
      * if we are requested to provide an allocation larger than our biggest
      * slab, just use malloc
      */
-    if (num > MAX_SLAB)
-        return malloc(num);
+    if (num > MAX_SLAB) {
+        ret = malloc(num);
+        SLAB_DBG_EVENT_SZ("nonslab-obj", ret, num, "allocate");
+        return ret;
+    }
 
     slab_idx = get_slab_idx(num);
     INC_SLAB_STAT(&myslabs[slab_idx].stats->allocs);
     ret = get_slab_obj(&myslabs[slab_idx]);
+    SLAB_DBG_EVENT_SZ("obj", ret, num, "allocate");
     return ret;
 }
 
@@ -858,11 +890,13 @@ static void slab_free(void *addr, const char *file, int line)
      * just get freed as they normally would
      */
     if (addr == NULL || !is_obj_slab(addr)) {
+        SLAB_DBG_EVENT("nonslab-obj", addr, "free");
         free(addr);
         return;
     }
     ring = get_slab_ring(addr);
     INC_SLAB_STAT(&ring->stats->frees);
+    SLAB_DBG_EVENT("obj", addr, "free");
     return_to_slab(addr, ring);
 }
 
@@ -916,8 +950,12 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
      * if the incomming address is not part of a slab already, then its
      * too big for the slab allocator, and se just use realloc
      */
-    if (!is_obj_slab(addr))
-        return realloc(addr, num);
+    if (!is_obj_slab(addr)) {
+        SLAB_DBG_EVENT("nonslab-obj", addr, "free");
+        new = realloc(addr, num);
+        SLAB_DBG_EVENT_SZ("nonslab-obj", new, num, "allocate");
+        return new;
+    }
 
     ring = get_slab_ring(addr);
 
@@ -926,6 +964,7 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
      */
     if (num > MAX_SLAB) {
         new = malloc(num);
+        SLAB_DBG_EVENT_SZ("nonslab-obj", new, num, "allocate");
         /*
          * If we get an object, then copy the size of the old object
          * to the new object, which is guaranteed to be less than what
