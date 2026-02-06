@@ -51,6 +51,17 @@
 #include <sys/mman.h>
 #include <openssl/crypto.h>
 
+/* __has_feature is a clang-ism, while __SANITIZE_ADDRESS__ is a gcc-ism */
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define __SANITIZE_ADDRESS__ 1
+#endif
+#endif
+
+#ifdef __SANITIZE_ADDRESS__
+#error Slab allocator cannot be used with asan, please disable slab-allocator
+#endif
+
 /**
  * @brief Global and supporting definitions for the slab allocator.
  *
@@ -87,19 +98,24 @@
  * Number of attempted frees that did not correspond to a valid slab
  * allocation.
  *
- * @var slab_stats::slab_victim_saves
- * Number of slabs that were reused from the victim cache
- *
  * @def INC_SLAB_STAT
  * Atomically increments the specified slab statistic counter using
  * relaxed memory ordering. When SLAB_STATS is not enabled, this macro
  * expands to a no-op.
  */
+
+#ifdef SLAB_STATS
+static size_t current_alloced_pages = 0;
+static size_t max_alloced_pages = 0;
+#endif
+
 static long page_size = 0;
 
 static pthread_key_t thread_slab_key;
 
 struct slab_class;
+
+#define SLAB_MAX_PAGE_POOL_COUNT 1024 
 
 #ifdef SLAB_DEBUG
 FILE *slab_fp = NULL;
@@ -108,8 +124,8 @@ FILE *slab_fp = NULL;
 #define SLAB_DBG_LOG(fmt, ...)
 #endif
 
-#define SLAB_DBG_EVENT_SZ(typ, addr, sz, event) SLAB_DBG_LOG("type:%s|addr:%p|event:%s|size:%lu|func:%s|line:%d\n", typ, (void *)addr, event, sz, OPENSSL_FUNC, OPENSSL_LINE)
-#define SLAB_DBG_EVENT(typ, addr, event) SLAB_DBG_LOG("type:%s|addr:%p|event:%s|func:%s|line:%d\n", typ, (void *)addr, event, OPENSSL_FUNC, OPENSSL_LINE)
+#define SLAB_DBG_EVENT_SZ(typ, addr, sz, event, file, line) SLAB_DBG_LOG("type:%s|addr:%p|event:%s|size:%lu|func:%s|line:%d\n", typ, (void *)addr, event, sz, file == NULL ? OPENSSL_FUNC : file, file == NULL ? OPENSSL_LINE: line)
+#define SLAB_DBG_EVENT(typ, addr, event, file, line) SLAB_DBG_LOG("type:%s|addr:%p|event:%s|func:%s|line:%d\n", typ, (void *)addr, event, file == NULL ? OPENSSL_FUNC : file, file == NULL ? OPENSSL_LINE : line)
 #define SLAB_MAGIC 0xdeadf00ddeadf00dUL
 
 #ifdef SLAB_STATS
@@ -118,54 +134,21 @@ struct slab_stats {
     size_t frees;
     size_t slab_allocs;
     size_t slab_frees;
+    size_t slab_mmaps;
+    size_t slab_munmaps;
+    size_t slab_pool_allocs;
     size_t failed_slab_frees;
-    size_t slab_victim_saves;
+    size_t pool_size_increases;
 };
 
-#define INC_SLAB_STAT(metric) __atomic_add_fetch(metric, 1, __ATOMIC_RELAXED)
+#define ADD_SLAB_STAT(metric, value) __atomic_add_fetch(metric, value, __ATOMIC_ACQ_REL)
+#define SUB_SLAB_STAT(metric, value) __atomic_sub_fetch(metric, value, __ATOMIC_ACQ_REL)
+#define INC_SLAB_STAT(metric) ADD_SLAB_STAT((metric), 1) 
 #else
+#define ADD_SLAB_STAT(metric, value)
+#define SUB_SLAB_STAT(metric, value)
 #define INC_SLAB_STAT(metric)
 #endif
-
-/**
- * @brief slab_set_flag(uint32_t *flagptr, uint8_t flagbit)
- *
- * set a bit in the flags field of a slab ring
- * sets the bit in question and returns if we actually set the bit
- */
-static inline int slab_set_flag(uint32_t *flagptr, uint8_t flagbit)
-{
-    uint32_t mask_val = (uint32_t)1 << flagbit;
-    uint32_t ret = __atomic_fetch_or(flagptr, mask_val, __ATOMIC_RELAXED);
-
-    return (mask_val & ret) ? 0 : 1;
-}
-
-/**
- * @brief slab_clear_flag(uint32_t *flagptr, uint8_t flagbit)
- *
- * clear a bit in the flags field of a slab ring
- * clears the bit in question and returns if we actually cleared the bit
- */
-static inline int slab_clear_flag(uint32_t *flagptr, uint8_t flagbit)
-{
-    uint32_t mask_val = ~((uint32_t)1 << flagbit);
-    uint32_t ret = __atomic_fetch_and(flagptr, mask_val, __ATOMIC_RELAXED);
-
-    return (~mask_val & ret) ? 1 : 0;
-}
-
-/**
- * @brief slab_test_flag(uint32_t flagptr, uint8_t flagbit)
- * tests a flag for being set, returns true if the flag is set
- */
-static inline int slab_test_flag(uint32_t *flagptr, uint8_t flagbit)
-{
-    uint32_t mask_val = (uint32_t)1 << flagbit;
-    uint32_t ret = __atomic_fetch_and(flagptr, mask_val, __ATOMIC_RELAXED);
-
-    return ret == 0 ? 0 : 1;
-}
 
 /**
  * @struct slab_data
@@ -180,6 +163,8 @@ static inline int slab_test_flag(uint32_t *flagptr, uint8_t flagbit)
  * allocation state of a single object within the slab.
  */
 struct slab_data {
+    struct slab_data *page_leader;
+
 #ifdef SLAB_STATS
     /**
      * Pointer to the slab size-class descriptor associated with this slab.
@@ -190,6 +175,11 @@ struct slab_data {
      * number of objects allocated on this slab 
      */
     uint64_t allocated_state;
+
+    /**
+     * Number of pages in use in this slabs pool 
+     */
+    uint64_t page_pool_state;
 
     /**
      * size of objects in this slab
@@ -206,6 +196,7 @@ struct slab_data {
      * Number of 64-bit words used by the allocation bitmap.
      */
     uint32_t bitmap_word_count;
+    uint32_t full_page_count;
 
     /**
      * Pointer to the start of the object storage region within the slab.
@@ -264,9 +255,24 @@ struct slab_class {
     struct slab_data *available;
 
     /**
-     * Victim cache to recycle a slab to avoid mumap if possible
+     * pointer to the pool of pages we have available
      */
-    struct slab_data *victim;
+    void *page_pool;
+
+    /**
+     * number of pages in a pool
+     */
+    uint32_t page_pool_count;
+
+    /*
+     * page pool index we are on
+     */
+    uint32_t page_pool_idx;
+
+    /**
+     * Number of times we call mmap for this slab
+     */
+    uint32_t mmap_count;
 
     /**
      * Size in bytes of each object allocated from this size class.
@@ -319,9 +325,9 @@ struct slab_class {
 #define MAX_SLAB 1 << MAX_SLAB_IDX
 
 #ifdef SLAB_STATS
-#define SLAB_INFO_INITIALIZER(order) { NULL, NULL, 1 << (order), &stats[(order)], { 0 } }
+#define SLAB_INFO_INITIALIZER(order, poolcnt) { NULL, NULL, (poolcnt), 0, 0,  1 << (order), &stats[(order)], { 0 } }
 #else
-#define SLAB_INFO_INITIALIZER(order) { NULL, NULL, 1 << (order), { 0 } }
+#define SLAB_INFO_INITIALIZER(order, poolcnt) { NULL, NULL, (poolcnt), 0, 0,  1 << (order), { 0 } }
 #endif
 
 #ifdef SLAB_STATS
@@ -343,19 +349,25 @@ static struct slab_stats stats[MAX_SLAB_IDX + 1] = { { 0 } };
  * and completed during allocator initialization.
  */
 static struct slab_class slabs[] = {
-    SLAB_INFO_INITIALIZER(0),
-    SLAB_INFO_INITIALIZER(1),
-    SLAB_INFO_INITIALIZER(2),
-    SLAB_INFO_INITIALIZER(3),
-    SLAB_INFO_INITIALIZER(4),
-    SLAB_INFO_INITIALIZER(5),
-    SLAB_INFO_INITIALIZER(6),
-    SLAB_INFO_INITIALIZER(7),
-    SLAB_INFO_INITIALIZER(8),
-    SLAB_INFO_INITIALIZER(9),
-    SLAB_INFO_INITIALIZER(10),
+    SLAB_INFO_INITIALIZER(0, 1),
+    SLAB_INFO_INITIALIZER(1, 1),
+    SLAB_INFO_INITIALIZER(2, 1),
+    SLAB_INFO_INITIALIZER(3, 1),
+    SLAB_INFO_INITIALIZER(4, 1),
+    SLAB_INFO_INITIALIZER(5, 1),
+    SLAB_INFO_INITIALIZER(6, 1),
+    SLAB_INFO_INITIALIZER(7, 1),
+    SLAB_INFO_INITIALIZER(8, 1),
+    SLAB_INFO_INITIALIZER(9, 1),
+    SLAB_INFO_INITIALIZER(10, 1),
 };
 
+/**
+ * @brief get the slab allocator for this thread
+ *
+ * Fetches the per-thread allocator for this thread,
+ * creating it if it doesnt yet exist
+ */
 static inline struct slab_class *get_thread_slab_table()
 {
     struct slab_class *info = pthread_getspecific(thread_slab_key);
@@ -370,7 +382,7 @@ static inline struct slab_class *get_thread_slab_table()
         memcpy(info, slabs, sizeof(slabs));
 
         pthread_setspecific(thread_slab_key, info);
-        SLAB_DBG_EVENT_SZ("allocator", info, sizeof(slabs), "allocate");
+        SLAB_DBG_EVENT_SZ("allocator", info, sizeof(slabs), "allocate", NULL, 0);
     }
     return info;
 }
@@ -430,6 +442,13 @@ static unsigned int get_slab_idx(size_t num)
 }
 
 /**
+ * @def SLAB_RING_ORPHANED
+ * @brief flag to indicate the slab is no longer used by the allocation
+ *        side of the allocator
+ */
+#define SLAB_RING_ORPHANED (1 << 0)
+
+/**
  * @brief atomically modify the allocation_state variable in a slab
  *
  * This function atomically adds the delta value provided to the atomic
@@ -444,35 +463,28 @@ static unsigned int get_slab_idx(size_t num)
  * @param new_count the modified count after the operation
  * @param new_flags the modified flags after the operation
  */
-static inline void slab_data_mod_allocated_state(struct slab_data *ring,
-                                                 int delta,
-                                                 uint32_t flags,
-                                                 uint32_t *new_count,
-                                                 uint32_t *new_flags)
+static inline void slab_data_mod_counter_state(uint64_t *counter,
+                                               int delta,
+                                               uint32_t flags,
+                                               uint32_t *new_count,
+                                               uint32_t *new_flags)
 {
-    uint64_t curr_allocated_state;
-    uint64_t new_allocated_state;
+    uint64_t curr_counter_state;
+    uint64_t new_counter_state;
 
-    curr_allocated_state = __atomic_load_n(&ring->allocated_state, __ATOMIC_RELAXED);
+    curr_counter_state = __atomic_load_n(counter, __ATOMIC_RELAXED);
     for (;;) {
-        *new_count = curr_allocated_state & 0x00000000ffffffffUL;
-        *new_flags = curr_allocated_state >> 32;
-        *new_count += delta;
-        *new_flags |= flags;
-        new_allocated_state = ((uint64_t)*new_flags << 32) | (uint64_t)*new_count;
-        if (__atomic_compare_exchange_n(&ring->allocated_state, &curr_allocated_state,
-                                        new_allocated_state, 0, __ATOMIC_ACQ_REL,
+        new_counter_state = ((uint64_t)(curr_counter_state & 0x00000000ffffffffUL) + delta) |
+                             ((uint64_t)((curr_counter_state >> 32) | flags) << 32);
+
+        if (__atomic_compare_exchange_n(counter, &curr_counter_state,
+                                        new_counter_state, 0, __ATOMIC_ACQ_REL,
                                         __ATOMIC_RELAXED))
             break;
     }
+    *new_count = (uint32_t)(new_counter_state & 0x00000000ffffffffUL);
+    *new_flags = (uint32_t)(new_counter_state >> 32);
 }
-
-/**
- * @def SLAB_RING_ORPHANED
- * @brief flag to indicate the slab is no longer used by the allocation
- *        side of the allocator
- */
-#define SLAB_RING_ORPHANED (1 << 0)
 
 /**
  * @brief sets flags on a slab_data
@@ -489,7 +501,7 @@ static inline void slab_data_set_flags(struct slab_data *ring,
                                        uint32_t *newcount,
                                        uint32_t *newflags)
 {
-    slab_data_mod_allocated_state(ring, 0, flags, newcount, newflags);
+    slab_data_mod_counter_state(&ring->allocated_state, 0, flags, newcount, newflags);
 }
 
 /**
@@ -506,7 +518,7 @@ static inline void slab_data_inc_obj_count(struct slab_data *ring,
                                            uint32_t *ret_count,
                                            uint32_t *ret_flags)
 {
-    slab_data_mod_allocated_state(ring, 1, 0, ret_count, ret_flags);
+    slab_data_mod_counter_state(&ring->allocated_state, 1, 0, ret_count, ret_flags);
 }
 
 /**
@@ -523,9 +535,22 @@ static inline void slab_data_dec_obj_count(struct slab_data *ring,
                                            uint32_t *ret_count,
                                            uint32_t *ret_flags)
 {
-    slab_data_mod_allocated_state(ring, -1, 0, ret_count, ret_flags);
+    slab_data_mod_counter_state(&ring->allocated_state, -1, 0, ret_count, ret_flags);
 }
 
+/**
+ * @brief modify the page_pool_state of a slab
+ *
+ * This function adds (or subtracts a count from the page_pool_state
+ */
+static inline void slab_pool_mod_obj_count(struct slab_data *ring,
+                                           int delta,
+                                           uint32_t *ret_count,
+                                           uint32_t *ret_flags)
+{
+    slab_data_mod_counter_state(&ring->page_pool_state, delta,
+                                0, ret_count, ret_flags);
+}
 
 /**
  * @def PAGE_MASK
@@ -566,6 +591,9 @@ static inline struct slab_data *get_slab_data(void *addr)
     return (struct slab_data *)PAGE_START(addr);
 }
 
+/**
+ * @brief checks if the slab magic value is correct
+ */
 static inline __attribute__((no_sanitize("address"))) int is_slab_magic_correct(void *addr)
 {
     struct slab_data *ring = get_slab_data(addr);
@@ -586,19 +614,6 @@ static inline __attribute__((no_sanitize("address"))) int is_slab_magic_correct(
  */
 static inline int is_obj_slab(void *addr)
 {
-    uintptr_t brk_limit = (uintptr_t)sbrk(0);
-
-    /*
-     * check to see if this address is below the brk limit
-     * if it is, we know that this isn't a slab
-     * We do this as a check before we trucate the address
-     * to find the page start, which may not be initialized
-     * for non slab allocations.  If we don't then things like
-     * asan get cranky and warn us about uninitialized usage
-     */
-    if ((uintptr_t)addr < brk_limit)
-        return 0;
-
     /*
      * also check if the address is on a page boundary
      * This indicates that it is not a slab, as slab objects
@@ -628,7 +643,7 @@ static inline int is_obj_slab(void *addr)
  * @return Pointer to the allocated object, or NULL if no free objects
  *         are available in the slab.
  */
-static void *select_obj(struct slab_data *slab)
+static inline void *select_obj(struct slab_data *slab)
 {
     uint32_t i;
     uint64_t value;
@@ -638,7 +653,6 @@ static void *select_obj(struct slab_data *slab)
     uint32_t ring_count, flags;
 
     for (i = 0; i < slab->bitmap_word_count; i++) {
-    try_again:
         value = __atomic_load_n(&slab->bitmap[i], __ATOMIC_RELAXED);
         if (value < UINT64_MAX) {
             /*
@@ -655,22 +669,50 @@ static void *select_obj(struct slab_data *slab)
              * Build a mask to turn the bit we found on
              */
             new_mask = (uint64_t)1 << available_bit;
-            value = atomic_fetch_or(&slab->bitmap[i], new_mask);
-            if ((value & new_mask) == new_mask) {
-                /* another  thread already set this bit, try again */
-                goto try_again;
-            }
+            __atomic_fetch_or(&slab->bitmap[i], new_mask, __ATOMIC_RELAXED);
             /*
              * We got an object!
              * compute the object location based on the bit in the bitmap that we just set
              */
-            obj_offset = (slab->obj_size * (i * 64)) + (available_bit * slab->obj_size);
             slab_data_inc_obj_count(slab, &ring_count, &flags);
+            obj_offset = (slab->obj_size * (i * 64)) + (available_bit * slab->obj_size);
             return (void *)((unsigned char *)slab->obj_start + obj_offset);
         }
     }
     return NULL;
 }
+
+#ifdef SLAB_STATS
+/**
+ * @brief update the maximum number of allocated pages we have outstanding
+ * 
+ * Used when stats are enabled, this function computes the current number
+ * of allocated pages, and stores that value to max_allocated_pages, if
+ * and only if the current computed value is larger than the value of
+ * max_alloced_pages
+ */
+static inline void update_max_alloced_pages()
+{
+    size_t my_max_alloced_pages;
+    size_t my_current_alloced_pages;
+    size_t my_new_max_alloced_pages;
+
+    my_max_alloced_pages = __atomic_load_n(&max_alloced_pages, __ATOMIC_RELAXED);
+    my_current_alloced_pages = __atomic_load_n(&current_alloced_pages, __ATOMIC_RELAXED);
+
+    for(;;) {
+        if (my_current_alloced_pages < my_max_alloced_pages)
+            break;
+        my_new_max_alloced_pages = my_current_alloced_pages;
+
+        if (__atomic_compare_exchange_n(&max_alloced_pages, &my_max_alloced_pages,
+                                        my_new_max_alloced_pages, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+}
+#endif
 
 /**
  * @brief Allocate and initialize a new slab ring page.
@@ -688,43 +730,81 @@ static void *select_obj(struct slab_data *slab)
  *
  * @return Pointer to the initialized slab_data, or NULL on failure.
  */
-static struct slab_data *create_new_slab(struct slab_class *slab)
+static inline struct slab_data *create_new_slab(struct slab_class *slab)
 {
     void *new;
     size_t page_size_long = (size_t)page_size;
     struct slab_data *new_ring;
-    int used_victim = 0;
-    /*
-     * Try to get a victimized slab
-     */
-    new = __atomic_exchange_n(&slab->victim, NULL, __ATOMIC_RELAXED);
+    struct slab_data *slab_page;
+    uint32_t page_idx;
 
-    if (new == NULL) {
+    /*
+     * Note, we don't always just allocate a single page here, to save time
+     * and avoid using mmap too much, we try to batch this operation, by allocating
+     * page_pool_count pages to a pool for this allocator, and then iterate over
+     * them on the allocation side.  This keeps us from having to use the slow mmap
+     * call too often
+     */
+    INC_SLAB_STAT(&slab->stats->slab_allocs);
+    if (slab->page_pool != NULL && slab->page_pool_idx < slab->page_pool_count) {
+        new = slab->page_pool;
+        slab->page_pool_idx++;
+        slab->page_pool = (void *)(((unsigned char *)new) + page_size_long);
+        INC_SLAB_STAT(&slab->stats->slab_pool_allocs);
+    } else {
+        if (slab->mmap_count > slab->template.available_objs * slab->page_pool_count) {
+            /*
+             * We're using this slab alot
+             * specifically we're using a heuristic here by checking
+             * to see if we've mapped as many page as we have in any single
+             * slab.  If we've done that, lets allocate more pages per
+             * mmap to try reduce the number of times we have to call mmap
+             * NOTE: We don't ever try to map more than SLAB_MAX_PAGE_POOL_COUNT
+             * pages at once.
+             */
+            if (slab->page_pool_count < SLAB_MAX_PAGE_POOL_COUNT) {
+                slab->page_pool_count *= 2;
+                INC_SLAB_STAT(&slab->stats->pool_size_increases);
+            }
+            slab->mmap_count = 0;
+        }
+        slab->mmap_count++;
         /*
          * New slabs must be page aligned so that our page offset math works.
-         * So use mmap to grap a page
+         * So use mmap to grab a pool of pages
          */
-        new = mmap(NULL, page_size_long, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        new = mmap(NULL, page_size_long * slab->page_pool_count, PROT_READ | PROT_WRITE,
+                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (new == NULL)
             return NULL;
-    } else {
-        used_victim = 1;
-    }
+        INC_SLAB_STAT(&slab->stats->slab_mmaps);
+        SLAB_DBG_EVENT_SZ("mmap",new, page_size_long * slab->page_pool_count, "allocate", NULL, 0); 
+        for (page_idx = 0; page_idx < slab->page_pool_count; page_idx++) {
+            slab_page = (struct slab_data *)(((uint8_t *)new) + (page_size_long * page_idx));
+            slab_page->page_leader = (struct slab_data *)new;
+            if (slab_page == (struct slab_data *)new) {
+                slab_page->page_pool_state = slab->page_pool_count;
+                slab_page->full_page_count = slab->page_pool_count;
+            }
+        }
+
+        ADD_SLAB_STAT(&current_alloced_pages, slab->page_pool_count);
+#ifdef SLAB_STATS
+        update_max_alloced_pages();
+#endif
+        slab->page_pool_idx = 1;
+        slab->page_pool = (void *)(((unsigned char *)new) + page_size_long);
+   }
 
     /*
      * setup this slab
      */
     new_ring = get_slab_data(new);
 
+    SLAB_DBG_EVENT_SZ("slab",new_ring, page_size_long, "allocate", NULL, 0);
 #ifdef SLAB_STATS
     new_ring->stats = slab->stats;
 #endif
-
-    if (used_victim == 1) {
-        INC_SLAB_STAT(&new_ring->stats->slab_victim_saves);
-    } else {
-        INC_SLAB_STAT(&new_ring->stats->slab_allocs);
-    }
 
     new_ring->allocated_state = 0;
     new_ring->obj_size = slab->obj_size;
@@ -734,7 +814,6 @@ static struct slab_data *create_new_slab(struct slab_class *slab)
     new_ring->bitmap[new_ring->bitmap_word_count - 1] = slab->template.last_word_mask;
     new_ring->obj_start = (void *)(new_ring->bitmap + new_ring->bitmap_word_count);
     new_ring->magic = SLAB_MAGIC;
-    SLAB_DBG_EVENT_SZ("slab",new_ring, page_size_long, "allocate");
     return new_ring;
 }
 
@@ -755,12 +834,14 @@ static struct slab_data *create_new_slab(struct slab_class *slab)
  * @return Pointer to the first allocated object in the new slab, or
  *         NULL on failure.
  */
-static void *create_obj_in_new_slab(struct slab_class *slab)
+static inline void *create_obj_in_new_slab(struct slab_class *slab)
 {
     struct slab_data *new = create_new_slab(slab);
+    struct slab_data *old;
     void *obj;
     uint32_t ring_count, flags;
     size_t page_size_long = (size_t)page_size;
+    uint32_t page_count;
 
     if (new == NULL)
         return NULL;
@@ -770,14 +851,27 @@ static void *create_obj_in_new_slab(struct slab_class *slab)
     new->bitmap[0] |= 0x1;
     obj = new->obj_start;
     slab_data_inc_obj_count(new, &ring_count, &flags);
-    new = __atomic_exchange_n(&slab->available, new, __ATOMIC_RELAXED);
-    if (new != NULL) {
-        slab_data_set_flags(new, SLAB_RING_ORPHANED, &ring_count, &flags);
+    old = slab->available;
+    slab->available = new;
+    if (old != NULL) {
+        slab_data_set_flags(old, SLAB_RING_ORPHANED, &ring_count, &flags);
         if (ring_count == 0) {
-            INC_SLAB_STAT(&new->stats->slab_frees);
-            SLAB_DBG_EVENT("slab",new,"free");
-            if (munmap(new, page_size_long)) {
-                INC_SLAB_STAT(&new->stats->failed_slab_frees);
+            INC_SLAB_STAT(&old->stats->slab_frees);
+            SLAB_DBG_EVENT("slab",old,"free", NULL, 0);
+            slab_pool_mod_obj_count(old->page_leader, -1, &page_count, &flags);
+            if (page_count == 0) {
+                /*
+                 * We're the last user of this pool, and the allocation side
+                 * isn't using it anymore, we can return it to the os
+                 */
+                INC_SLAB_STAT(&old->stats->slab_munmaps);
+                SLAB_DBG_EVENT_SZ("mmap",old->page_leader,
+                                  page_size_long * old->page_leader->full_page_count,
+                                  "free", NULL, 0); 
+                SUB_SLAB_STAT(&current_alloced_pages, old->page_leader->full_page_count);
+                if (munmap(old->page_leader, page_size_long * old->page_leader->full_page_count)) {
+                    INC_SLAB_STAT(&old->stats->failed_slab_frees);
+                }
             }
         }
     }
@@ -800,12 +894,12 @@ static void *create_obj_in_new_slab(struct slab_class *slab)
  *
  * @return Pointer to an allocated object, or NULL on failure.
  */
-static void *get_slab_obj(struct slab_class *slab)
+static inline void *get_slab_obj(struct slab_class *slab)
 {
     struct slab_data *idx;
     void *obj = NULL;
 
-    idx = __atomic_load_n(&slab->available, __ATOMIC_RELAXED);
+    idx = slab->available;
     if (idx != NULL)
         obj = select_obj(idx);
     if (obj != NULL)
@@ -845,9 +939,7 @@ static void return_to_slab(void *addr, struct slab_data *ring)
     uint64_t value;
     size_t page_size_long = (size_t)page_size;
     uint32_t obj_count, flags;
-    struct slab_data *victim_data = NULL;
-    struct slab_class *info = get_thread_slab_table();
-    unsigned int idx = get_slab_idx(ring->obj_size);
+    uint32_t page_count;
 
     /*
      * compute the offset of the object from the start of the slab
@@ -872,25 +964,19 @@ static void return_to_slab(void *addr, struct slab_data *ring)
      * check to see if we are removing the last object in this slab 
      */
     if (obj_count == 0 && (flags & SLAB_RING_ORPHANED)) {
-        /*
-         * Before we free, try to add the slab to the victim cache
-         * Note that we may be returning the slab to a different allocator
-         * than the one that initially created it, thats ok.
-         * We do this because we can only be guaranteed that the allocator
-         * for this table still exists, i.e. another threads allocator may have
-         * exited already, freeing that allocator.
-         */
-        if (!__atomic_compare_exchange_n(&info[idx].victim, &victim_data, ring,
-                                         0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            /*
-             * Theres already a victim for this slab, so just free, this one
-             */
-            INC_SLAB_STAT(&ring->stats->slab_frees);
+        INC_SLAB_STAT(&ring->stats->slab_frees);
+        SLAB_DBG_EVENT("slab",ring,"free", NULL, 0);
+        slab_pool_mod_obj_count(ring->page_leader, -1, &page_count, &flags);
+        if (page_count == 0) {
             /*
              * return the slab to the OS with munmap
              */
-            SLAB_DBG_EVENT("slab",ring,"free");
-            if (munmap(ring, page_size_long)) {
+            INC_SLAB_STAT(&ring->stats->slab_munmaps);
+            SLAB_DBG_EVENT_SZ("mmap", ring->page_leader,
+                              page_size_long * ring->page_leader->full_page_count,
+                              "free", NULL, 0); 
+            SUB_SLAB_STAT(&current_alloced_pages, ring->page_leader->full_page_count);
+            if (munmap(ring->page_leader, page_size_long * ring->page_leader->full_page_count)) {
                 INC_SLAB_STAT(&ring->stats->failed_slab_frees);
             }
             return;
@@ -933,10 +1019,7 @@ static void *slab_malloc(size_t num, const char *file, int line)
     struct slab_class *myslabs = get_thread_slab_table();
     void *ret;
 
-    if (myslabs == NULL)
-        return NULL;
-
-    if (num == 0)
+    if (myslabs == NULL || num == 0)
         return NULL;
 
     /*
@@ -945,14 +1028,14 @@ static void *slab_malloc(size_t num, const char *file, int line)
      */
     if (num > MAX_SLAB) {
         ret = malloc(num);
-        SLAB_DBG_EVENT_SZ("nonslab-obj", ret, num, "allocate");
+        SLAB_DBG_EVENT_SZ("nonslab-obj", ret, num, "allocate", file, line);
         return ret;
     }
 
     slab_idx = get_slab_idx(num);
     INC_SLAB_STAT(&myslabs[slab_idx].stats->allocs);
     ret = get_slab_obj(&myslabs[slab_idx]);
-    SLAB_DBG_EVENT_SZ("obj", ret, num, "allocate");
+    SLAB_DBG_EVENT_SZ("obj", ret, num, "allocate", file, line);
     return ret;
 }
 
@@ -988,13 +1071,13 @@ static void slab_free(void *addr, const char *file, int line)
      * just get freed as they normally would
      */
     if (addr == NULL || !is_obj_slab(addr)) {
-        SLAB_DBG_EVENT("nonslab-obj", addr, "free");
+        SLAB_DBG_EVENT("nonslab-obj", addr, "free", file, line);
         free(addr);
         return;
     }
     ring = get_slab_data(addr);
     INC_SLAB_STAT(&ring->stats->frees);
-    SLAB_DBG_EVENT("obj", addr, "free");
+    SLAB_DBG_EVENT("obj", addr, "free", file, line);
     return_to_slab(addr, ring);
 }
 
@@ -1049,9 +1132,9 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
      * too big for the slab allocator, and se just use realloc
      */
     if (!is_obj_slab(addr)) {
-        SLAB_DBG_EVENT("nonslab-obj", addr, "free");
+        SLAB_DBG_EVENT("nonslab-obj", addr, "free", file, line);
         new = realloc(addr, num);
-        SLAB_DBG_EVENT_SZ("nonslab-obj", new, num, "allocate");
+        SLAB_DBG_EVENT_SZ("nonslab-obj", new, num, "allocate", file, line);
         return new;
     }
 
@@ -1062,7 +1145,7 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
      */
     if (num > MAX_SLAB) {
         new = malloc(num);
-        SLAB_DBG_EVENT_SZ("nonslab-obj", new, num, "allocate");
+        SLAB_DBG_EVENT_SZ("nonslab-obj", new, num, "allocate", file, line);
         /*
          * If we get an object, then copy the size of the old object
          * to the new object, which is guaranteed to be less than what
@@ -1089,7 +1172,7 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
      * We need to swap slab objects, so get one from the next size we need
      */
 
-    new = slab_malloc(num, NULL, 0);
+    new = slab_malloc(num, file, line);
 
     /*
      * And if its not null, copy the old object into the new space
@@ -1100,7 +1183,7 @@ static void *slab_realloc(void *addr, size_t num, const char *file, int line)
     /*
      * and free the old object
      */
-    slab_free(addr, NULL, 0);
+    slab_free(addr, file, line);
     return new;
 }
 
@@ -1172,6 +1255,7 @@ static void destroy_slab_table(void *data)
     uint32_t i;
     uint32_t count, flags;
     size_t page_size_long = (size_t)page_size;
+    uint32_t page_count;
 
     if (info == NULL)
         return;
@@ -1180,21 +1264,32 @@ static void destroy_slab_table(void *data)
             slab_data_set_flags(info[i].available, SLAB_RING_ORPHANED, &count, &flags);
             if (count == 0) {
                 INC_SLAB_STAT(&info[i].stats->slab_frees);
-                SLAB_DBG_EVENT("slab",info[i].available,"free");
-                if (munmap(info[i].available, page_size_long)) {
-                    INC_SLAB_STAT(&info[i].stats->failed_slab_frees);
+                SLAB_DBG_EVENT("slab",info[i].available,"free", NULL, 0);
+                /*
+                 * We have to be a bit tricky here.
+                 * We can't just drop the page count by one, as there may be more pages
+                 * in the pool that haven't been touched yet.  But since we know
+                 * we're never going to allocate from this pool again, we can subtract
+                 * all the pages remaining in the pool to see if we hit zero
+                 */
+                slab_pool_mod_obj_count(info[i].available->page_leader,
+                                        (info[i].page_pool_idx - 1) - info[i].available->page_leader->full_page_count,
+                                        &page_count, &flags); 
+                if (page_count == 0) {
+                    INC_SLAB_STAT(&info[i].stats->slab_munmaps);
+                    SLAB_DBG_EVENT_SZ("mmap", info[i].available->page_leader,
+                                      page_size_long * info[i].available->page_leader->full_page_count,
+                                      "free", NULL, 0);
+                    SUB_SLAB_STAT(&current_alloced_pages, info[i].available->page_leader->full_page_count);
+                    if (munmap(info[i].available->page_leader,
+                               page_size_long * info[i].available->page_leader->full_page_count)) {
+                        INC_SLAB_STAT(&info[i].stats->failed_slab_frees);
+                    }
                 }
-            }
-            if (info[i].victim != NULL) {
-                INC_SLAB_STAT(&info[i].stats->slab_frees);
-                SLAB_DBG_EVENT("slab",info[i].victim,"free");
-                if (munmap(info[i].victim, page_size_long)) {
-                    INC_SLAB_STAT(&info[i].stats->failed_slab_frees);
-               }
             }
         }
     }
-    SLAB_DBG_EVENT("allocator", info, "free");
+    SLAB_DBG_EVENT("allocator", info, "free", NULL, 0);
     pthread_setspecific(thread_slab_key, NULL);
     free(info);
 }
@@ -1282,16 +1377,19 @@ static __attribute__((destructor)) void slab_cleanup()
     fprintf(fp, "{ \"cmd\": \"%s\", \"slabs\": [", cmdstring);
 
     for (i = 0; i <= MAX_SLAB_IDX; i++) {
-        fprintf(fp, "{\"obj_size\":%lu, \"objs_per_slab\":%u, \"allocs\":%lu, \"frees\":%lu, \"slab_allocs\":%lu, \"slab_frees\":%lu, \"slab_victim_saves\":%lu, \"failed_slab_frees\":%lu}",
+        fprintf(fp, "{\"obj_size\":%lu, \"objs_per_slab\":%u, \"allocs\":%lu, \"frees\":%lu, \"slab_allocs\":%lu, \"slab_frees\":%lu, \"failed_slab_frees\":%lu, \"pool_size_increases\":%lu, \"slab_maps\":%lu, \"slab_munmaps\":%lu}",
             slabs[i].obj_size, slabs[i].template.available_objs,
             slabs[i].stats->allocs, slabs[i].stats->frees,
             slabs[i].stats->slab_allocs, slabs[i].stats->slab_frees,
-            slabs[i].stats->slab_victim_saves,
-            slabs[i].stats->failed_slab_frees);
+            slabs[i].stats->failed_slab_frees,
+            slabs[i].stats->pool_size_increases,
+            slabs[i].stats->slab_mmaps,
+            slabs[i].stats->slab_munmaps);
         if (i != MAX_SLAB_IDX)
             fprintf(fp, ",");
     }
-    fprintf(fp, "]}");
+    fprintf(fp, "],");
+    fprintf(fp, "\"max_alloced_pages\":%lu}", max_alloced_pages);
     if (fp != stderr)
         fclose(fp);
 #endif
